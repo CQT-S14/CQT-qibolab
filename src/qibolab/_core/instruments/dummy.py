@@ -1,6 +1,7 @@
+import logging
+
 import numpy as np
 from pydantic import Field
-from qibo.config import log
 
 from qibolab._core.components import Channel, Config
 from qibolab._core.execution_parameters import (
@@ -12,13 +13,13 @@ from qibolab._core.identifier import ChannelId
 from qibolab._core.pulses import Acquisition
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import ParallelSweepers
-from qibolab._core.unrolling import Bounds
 
 from .abstract import Controller
 from .oscillator import LocalOscillator
 
+log = logging.getLogger(__name__)
+
 SAMPLING_RATE = 1
-BOUNDS = Bounds(waveforms=1, readout=1, instructions=1)
 
 
 __all__ = ["DummyLocalOscillator", "DummyInstrument"]
@@ -71,7 +72,6 @@ class DummyInstrument(Controller):
     """
 
     address: str
-    bounds: str = "dummy/bounds"
     channels: dict[ChannelId, Channel] = Field(default_factory=dict)
 
     @property

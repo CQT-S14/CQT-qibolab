@@ -3,17 +3,16 @@ from collections.abc import Iterable
 import numpy as np
 from numpy.typing import NDArray
 
-from qibolab._core.execution_parameters import (
+from ...execution_parameters import (
     AcquisitionType,
     AveragingMode,
     ExecutionParameters,
 )
-from qibolab._core.identifier import ChannelId, QubitId, Result
-from qibolab._core.pulses.pulse import Acquisition, PulseId, Readout
-from qibolab._core.sequence import PulseSequence
-
+from ...identifier import ChannelId, QubitId, Result
+from ...pulses import Acquisition, PulseId, Readout
+from ...sequence import PulseSequence
+from .engine import Operator
 from .hamiltonians import HamiltonianConfig
-from .operators import Operator
 
 
 def ndchoice(probabilities: NDArray, samples: int) -> NDArray:
@@ -76,6 +75,7 @@ def acquisitions(sequence: PulseSequence) -> dict[PulseId, float]:
             if isinstance(ev, (Acquisition, Readout)):
                 acq[ev.id] = time
             time += ev.duration
+
     return acq
 
 
@@ -122,7 +122,6 @@ def results(
         hamiltonian.nqubits,
         hamiltonian.transmon_levels,
     )
-
     assert options.nshots is not None
     sampled = shots(np.moveaxis(probabilities, -2, 0), options.nshots)
     # move measurements dimension to the front, getting ready for extraction

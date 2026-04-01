@@ -1,6 +1,8 @@
 from dataclasses import asdict, dataclass, field
 from typing import Optional, Union
 
+import numpy as np
+
 from qibolab._core.components import (
     AcquisitionChannel,
     DcChannel,
@@ -9,7 +11,7 @@ from qibolab._core.components import (
     OscillatorConfig,
 )
 from qibolab._core.identifier import ChannelId
-from qibolab._core.pulses import Pulse, Readout
+from qibolab._core.pulses import Custom, Pulse, Readout
 
 from ..components import MwFemOscillatorConfig, OpxOutputConfig, QmAcquisitionConfig
 from .devices import (
@@ -86,12 +88,13 @@ class Configuration:
     ):
         controller = self.controllers[channel.device]
         if controller.type == "opx1":
-            keys = ["offset", "filter"]
+            keys = ["offset"]
         else:
             keys = list(config.model_fields.keys())
             keys.remove("kind")
         config_values = config.model_dump()
         values = {k: config_values[k] for k in keys}
+        values.update({"filter": config.filter})
         if config.sampling_rate > 1e9:
             del values["upsampling_mode"]
         controller.analog_outputs[channel.port] = values
@@ -236,8 +239,42 @@ class Configuration:
         op = operation(readout)
         acquisition = f"{op}_{element}"
         if acquisition not in self.pulses:
+            new_probe = readout.probe.model_copy(
+                update=dict(
+                    duration=readout.acquisition.duration,
+                    envelope=Custom(
+                        i_=np.pad(
+                            readout.probe.envelope.i(int(readout.probe.duration)),
+                            (
+                                0,
+                                int(
+                                    readout.acquisition.duration
+                                    - readout.probe.duration
+                                ),
+                            ),
+                            mode="constant",
+                            constant_values=0,
+                        ),
+                        q_=np.pad(
+                            readout.probe.envelope.q(int(readout.probe.duration)),
+                            (
+                                0,
+                                int(
+                                    readout.acquisition.duration
+                                    - readout.probe.duration
+                                ),
+                            ),
+                            mode="constant",
+                            constant_values=0,
+                        ),
+                    ),
+                )
+            )
             self.pulses[acquisition] = self.register_waveforms(
-                readout.probe, sampling_rate, max_voltage, element
+                new_probe,
+                sampling_rate,
+                max_voltage,
+                element,
             )
         self.elements[element].operations[op] = acquisition
         return op

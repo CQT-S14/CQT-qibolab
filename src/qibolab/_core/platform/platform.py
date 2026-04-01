@@ -1,10 +1,10 @@
 """A platform for executing quantum algorithms."""
 
+import logging
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
-
-from qibo.config import log, raise_error
 
 from ..components import Config
 from ..components.channels import Channel
@@ -24,11 +24,12 @@ from ..pulses import PulseId
 from ..qubits import Qubit
 from ..sequence import PulseSequence
 from ..sweeper import ParallelSweepers
-from ..unrolling import Bounds, batch
 
 __all__ = ["Platform"]
 
 PARAMETERS = "parameters.json"
+
+log = logging.getLogger(__name__)
 
 
 def _channels_map(elements: QubitMap) -> dict[ChannelId, QubitId]:
@@ -75,6 +76,8 @@ class Platform:
 
     def __post_init__(self):
         log.info("Loading platform %s", self.name)
+        signal.signal(signal.SIGTERM, self.termination_handler)
+        signal.signal(signal.SIGINT, self.termination_handler)
         if self.resonator_type is None:
             self.resonator_type = "3D" if self.nqubits == 1 else "2D"
 
@@ -155,8 +158,7 @@ class Platform:
                 try:
                     instrument.connect()
                 except Exception as exception:
-                    raise_error(
-                        RuntimeError,
+                    raise RuntimeError(
                         f"Cannot establish connection to instrument {name}. Error captured: '{exception}'",
                     )
         self.is_connected = True
@@ -167,6 +169,12 @@ class Platform:
             for instrument in self.instruments.values():
                 instrument.disconnect()
         self.is_connected = False
+
+    def termination_handler(self, signum, frame):
+        self.disconnect()
+        raise RuntimeError(
+            f"Platform {self.name} disconnected because job was cancelled. Signal type: {signum}."
+        )
 
     @property
     def _controller(self):
@@ -220,8 +228,8 @@ class Platform:
             .. testcode::
 
                 import numpy as np
-                from qibolab import Parameter, PulseSequence, Sweeper, create_dummy
-
+                from qibolab import Parameter, PulseSequence, Sweeper
+                from qibolab.instruments.dummy import create_dummy
 
                 platform = create_dummy()
                 qubit = platform.qubits[0]
@@ -247,7 +255,7 @@ class Platform:
         options = self.settings.fill(ExecutionParameters(**options))
 
         time = options.estimate_duration(sequences, sweepers)
-        log.info(f"Minimal execution time: {time}")
+        log.info(f"Minimal execution time: {time:.3f} s")
 
         configs = self.parameters.configs.copy()
         update_configs(configs, options.updates)
@@ -258,12 +266,7 @@ class Platform:
             if name in self.instruments:
                 self.instruments[name].setup(**cfg.model_dump(exclude={"kind"}))
 
-        results = {}
-        # pylint: disable=unsubscriptable-object
-        bounds = self.parameters.configs[self._controller.bounds]
-        assert isinstance(bounds, Bounds)
-        for b in batch(sequences, bounds):
-            results |= self._execute(b, options, configs, sweepers)
+        results = self._execute(sequences, options, configs, sweepers)
 
         return results
 

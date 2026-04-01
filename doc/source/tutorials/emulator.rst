@@ -1,3 +1,10 @@
+.. admonition:: Work in progress
+
+    This page is only partially updated from a previous version of Qibolab.
+
+    In case of doubts, contact the `Qibo developers
+    <https://github.com/qiboteam/qibo#contacts>`_.
+
 How to emulate a QPU using Qibolab?
 ===================================
 
@@ -14,19 +21,13 @@ platform. All parameters related to the Hamiltonian to be simulated are coded di
 the section ``configs``. Here is an example
 
 
-.. collapse:: Parameters dictionary
+.. dropdown:: Parameters dictionary
 
     .. testcode::  python
 
         parameters = {
             "settings": {"nshots": 1024, "relaxation_time": 0},
             "configs": {
-                "emulator/bounds": {
-                    "kind": "bounds",
-                    "waveforms": 1000000,
-                    "readout": 50,
-                    "instructions": 200,
-                },
                 "hamiltonian": {
                     "transmon_levels": 2,
                     "qubits": {

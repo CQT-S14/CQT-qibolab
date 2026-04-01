@@ -36,7 +36,6 @@ from .native import Native, NativeContainer, SingleQubitNatives, TwoQubitNatives
 from .pulses import Acquisition, Pulse, Readout, Rectangular
 from .qubits import Qubit
 from .serialize import Model, replace
-from .unrolling import Bounds
 
 __all__ = [
     "ConfigKinds",
@@ -115,10 +114,17 @@ class TwoQubitContainer(dict[QubitPairId, TwoQubitNatives]):
         try:
             return super().__getitem__(key)
         except KeyError:
-            value = super().__getitem__((key[1], key[0]))
+            try:
+                value = super().__getitem__((key[1], key[0]))
+            except KeyError:
+                raise KeyError(
+                    f"No two-qubit gate for qubits {key} is defined in the platform."
+                )
             if value.symmetric:
                 return value
-            raise
+            raise KeyError(
+                f"Two-qubit gate {key} not symmetric and only {(key[1], key[0])} is defined in the platform."
+            )
 
 
 class NativeGates(Model):
@@ -131,6 +137,10 @@ class NativeGates(Model):
     coupler: dict[QubitId, SingleQubitNatives] = Field(default_factory=dict)
     two_qubit: TwoQubitContainer = Field(default_factory=dict)
 
+    @property
+    def element(self) -> dict[QubitId, SingleQubitNatives]:
+        return self.single_qubit | self.coupler
+
 
 ComponentId = str
 """Identifier of a generic component.
@@ -141,7 +151,7 @@ This is assumed to always be in its serialized form.
 # TODO: replace _UnionType with UnionType, once py3.9 will be abandoned
 _UnionType = Any
 _ChannelConfigT = Union[_UnionType, type[Config]]
-_BUILTIN_CONFIGS: tuple[_ChannelConfigT, ...] = (ChannelConfig, Bounds)
+_BUILTIN_CONFIGS: tuple[_ChannelConfigT, ...] = (ChannelConfig,)
 
 
 class ConfigKinds:

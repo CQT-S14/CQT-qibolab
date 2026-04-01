@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Optional, Union
 
 from pydantic import Field
-from qm import QuantumMachinesManager, generate_qua_script
-from qm.octave import QmOctaveConfig
+from qm import QmPendingJob, QuantumMachine, QuantumMachinesManager, generate_qua_script
+from qm.api.v2.qm_api_old import QmApiWithDeprecations
 from qm.simulate.credentials import create_credentials
 
 from qibolab._core.components import (
@@ -24,13 +24,14 @@ from qibolab._core.execution_parameters import ExecutionParameters
 from qibolab._core.identifier import ChannelId
 from qibolab._core.instruments.abstract import Controller
 from qibolab._core.pulses import Align, Delay, Pulse, Readout
+from qibolab._core.pulses.envelope import Rectangular
 from qibolab._core.sequence import PulseSequence
+from qibolab._core.serialize import Model
 from qibolab._core.sweeper import ParallelSweepers, Parameter, Sweeper
-from qibolab._core.unrolling import unroll_sequences
 
 from .components import MwFemOscillatorConfig, OpxOutputConfig, QmAcquisitionConfig
 from .config import Configuration, ControllerId, ModuleTypes
-from .program import ExecutionArguments, create_acquisition, program
+from .program import Acquisitions, ExecutionArguments, create_acquisition, program
 from .program.sweepers import find_lo_frequencies, sweeper_amplitude
 
 CALIBRATION_DB = "calibration_db.json"
@@ -72,27 +73,7 @@ class Octave:
     """OPXplus that acts as the waveform generator for the Octave."""
 
 
-def declare_octaves(octaves, host, calibration_path=None):
-    """Initiate Octave configuration and add octaves info.
-
-    Args:
-        octaves (dict): Dictionary containing :class:`qibolab.instruments.qm.devices.Octave` objects
-            for each Octave device in the experiment configuration.
-        host (str): IP of the Quantum Machines controller.
-        calibration_path (str): Path to the JSON file with the mixer calibration.
-    """
-    if len(octaves) == 0:
-        return None
-
-    config = QmOctaveConfig()
-    if calibration_path is not None:
-        config.set_calibration_db(calibration_path)
-    for octave in octaves.values():
-        config.add_device_info(octave.name, host, octave.port)
-    return config
-
-
-def fetch_results(result, acquisitions):
+def fetch_results(handles, acquisitions):
     """Fetches results from an executed experiment.
 
     Args:
@@ -102,8 +83,6 @@ def fetch_results(result, acquisitions):
     Returns:
         Dictionary with the results in the format required by the platform.
     """
-    handles = result.result_handles
-    handles.wait_for_all_values()  # for async replace with ``handles.is_processing()``
     results = defaultdict(list)
     for acquisition in acquisitions:
         data = acquisition.fetch(handles)
@@ -125,6 +104,123 @@ def find_sweepers(
     in the QM ``config``.
     """
     return [s for ps in sweepers for s in ps if s.parameter is parameter]
+
+
+class Experiment(Model):
+    configs: dict[str, Config]
+    sequences: list[PulseSequence]
+    sweepers: list[ParallelSweepers]
+
+
+class Cache(Model):
+    machine: Union[QuantumMachine, QmApiWithDeprecations]
+    program_id: str
+    acquisitions: Acquisitions
+
+    def run(self) -> QmPendingJob:
+        return self.machine.queue.add_compiled(self.program_id)
+
+
+def _update_pulse_amplitude(
+    pulse: Union[Pulse, Readout], amplitude: float
+) -> Union[Pulse, Readout]:
+    """Update pulse amplitude.
+
+    Needed when sweeping amplitude because the original amplitude
+    may not sufficient to reach all the sweeper values.
+    """
+    if isinstance(pulse, Pulse):
+        return pulse.model_copy(update={"amplitude": amplitude})
+    probe = pulse.probe.model_copy(update={"amplitude": amplitude})
+    return pulse.model_copy(update={"probe": probe})
+
+
+QM_BOUNDS = {
+    "waveforms": 40000.0,
+    "readout": 30,
+    "instructions": 1000000,
+}
+
+
+def _waveform(sequence: PulseSequence):
+    # TODO: deduplicate pulses (Not yet as drivers may not support it yet)
+    # TODO: VirtualZ deserves a separate handling
+    # TODO: any constant part of a pulse should be counted only once (Zurich Instruments supports this)
+    # TODO: handle multiple qubits or do all devices have the same memory for each channel ?
+    return sum(
+        (
+            (pulse.duration if not isinstance(pulse.envelope, Rectangular) else 1)
+            if isinstance(pulse, Pulse)
+            else 1
+        )
+        for _, pulse in sequence
+    )
+
+
+def _readout(sequence: PulseSequence):
+    # TODO: Do we count 1 readout per pulse or 1 readout per multiplexed readout ?
+    return len(sequence.acquisitions)
+
+
+def _instructions(sequence: PulseSequence):
+    return len(sequence)
+
+
+def _batch(sequences: list[PulseSequence], bounds: dict = QM_BOUNDS):
+    """Split a list of sequences to batches.
+
+    Takes into account the various limitations specified by the `bounds` argument.
+    """
+    counters = {"waveforms": 0, "readout": 0, "instructions": 0}
+    batch = []
+    for sequence in sequences:
+        update_vals = {
+            "waveforms": _waveform(sequence),
+            "readout": _readout(sequence),
+            "instructions": _instructions(sequence),
+        }
+        bounds_exceeded = any(counters[k] + update_vals[k] > bounds[k] for k in bounds)
+        if bounds_exceeded:
+            if batch:
+                yield batch
+            counters = update_vals.copy()
+            batch = [sequence]
+        else:
+            batch.append(sequence)
+            for k in counters:
+                counters[k] += update_vals[k]
+    if batch:
+        yield batch
+
+
+def _unroll_sequences(
+    sequences: list[PulseSequence], relaxation_time: int
+) -> tuple[PulseSequence, dict[int, list[int]]]:
+    """Unrolls a list of pulse sequences to a single sequence.
+
+    The resulting sequence may contain multiple measurements.
+
+    `relaxation_time` is the time in ns to wait for the qubit to relax between playing
+    different sequences.
+
+    It returns both the unrolled pulse sequence, and the map from original readout pulse
+    serials to the unrolled readout pulse serials. Required to construct the results
+    dictionary that is returned after execution.
+    """
+    total_sequence = PulseSequence()
+    readout_map = defaultdict(list)
+    for sequence in sequences:
+        total_sequence.concatenate(sequence)
+        # TODO: Fix unrolling results
+        for _, acq in sequence.acquisitions:
+            readout_map[acq.id].append(acq.id)
+
+        length = sequence.duration + relaxation_time
+        for channel in sequence.channels:
+            delay = length - sequence.channel_duration(channel)
+            total_sequence.append((channel, Delay(duration=delay)))
+
+    return total_sequence, readout_map
 
 
 class QmController(Controller):
@@ -167,8 +263,6 @@ class QmController(Controller):
     https://docs.quantum-machines.co/latest/docs/Hardware/network_and_router/#accessing-the-cluster
     for more details.
     """
-    bounds: str = "qm/bounds"
-    """Maximum bounds used for batching in sequence unrolling."""
     calibration_path: Optional[PathLike] = None
     """Path to the JSON file that contains the mixer calibration."""
     write_calibration: bool = False
@@ -192,6 +286,8 @@ class QmController(Controller):
 
     config: Configuration = Field(default_factory=Configuration)
     """Configuration dictionary required for pulse execution on the OPXs."""
+    experiment: Optional[Experiment] = None
+    cache: Optional[Cache] = None
 
     simulation_duration: Optional[int] = None
     """Duration for the simulation in ns.
@@ -241,16 +337,15 @@ class QmController(Controller):
         """Connect to the Quantum Machines manager."""
         host, port = self.address.split(":")
         self._temporary_calibration()
-        octave = declare_octaves(self.octaves, host, self._calibration_path)
         credentials = None
         if self.cloud:
             credentials = create_credentials()
         self.manager = QuantumMachinesManager(
             host=host,
             port=int(port),
-            octave=octave,
             credentials=credentials,
             cluster_name=self.cluster_name,
+            octave_calibration_db_path=self._calibration_path,
         )
 
     def disconnect(self):
@@ -263,7 +358,7 @@ class QmController(Controller):
 
     def configure_device(self, device: str):
         """Add device in the ``config``."""
-        if "octave" in device:
+        if "oct" in device:
             self.config.add_octave(device, self.octaves[device].connectivity, self.fems)
         else:
             self.config.add_controller(device, self.fems)
@@ -444,7 +539,7 @@ class QmController(Controller):
         """
         amplitude = sweeper_amplitude(sweeper.values)
         for pulse in sweeper.pulses:
-            sweep_pulse = pulse.model_copy(update={"amplitude": amplitude})
+            sweep_pulse = _update_pulse_amplitude(pulse, amplitude)
             ids = args.sequence.pulse_channels(pulse.id)
             params = args.parameters[pulse.id]
             params.amplitude_pulse = sweep_pulse
@@ -457,7 +552,7 @@ class QmController(Controller):
         configs: dict[str, Config],
         sequence: PulseSequence,
         options: ExecutionParameters,
-    ):
+    ) -> Acquisitions:
         """Add all measurements of a given sequence in the QM ``config``.
 
         Returns:
@@ -467,11 +562,6 @@ class QmController(Controller):
         for channel_id, readout in sequence:
             if not isinstance(readout, Readout):
                 continue
-
-            if readout.probe.duration != readout.acquisition.duration:
-                raise ValueError(
-                    "Quantum Machines does not support acquisition with different duration than probe."
-                )
 
             probe_id = self.channels[channel_id].probe
             max_voltage = channel_max_voltage(configs[probe_id])
@@ -504,7 +594,8 @@ class QmController(Controller):
     ):
         """Preprocessing and checks needed before executing some sweeps.
 
-        Amplitude and duration sweeps require registering additional pulses in the QM ``config.
+        Amplitude and duration sweeps require registering additional pulses in the QM
+        ``config``.
         """
         for sweeper in find_sweepers(sweepers, Parameter.frequency):
             channels = [(id, self.channels[id]) for id in sweeper.channels]
@@ -522,11 +613,6 @@ class QmController(Controller):
         for sweeper in find_sweepers(sweepers, Parameter.duration_interpolated):
             self.register_duration_sweeper_pulses(args, configs, sweeper)
 
-    def execute_program(self, program):
-        """Executes an arbitrary program written in QUA language."""
-        machine = self.manager.open_qm(asdict(self.config))
-        return machine.execute(program)
-
     def play(
         self,
         configs: dict[str, Config],
@@ -534,40 +620,66 @@ class QmController(Controller):
         options: ExecutionParameters,
         sweepers: list[ParallelSweepers],
     ):
-        if len(sequences) == 0:
-            return {}
-        elif len(sequences) == 1:
-            sequence = sequences[0]
-        else:
-            sequence, _ = unroll_sequences(sequences, options.relaxation_time)
+        results = {}
+        for batched_sequences in _batch(sequences):
+            if len(batched_sequences) == 0:
+                return {}
+            elif len(batched_sequences) == 1:
+                sequence = batched_sequences[0]
+            else:
+                sequence, _ = _unroll_sequences(
+                    batched_sequences, options.relaxation_time
+                )
 
-        if len(sequence) == 0:
-            return {}
+            if len(sequence) == 0:
+                return {}
 
-        # register DC elements so that all qubits are
-        # sweetspot even when they are not used
-        for id, channel in self.channels.items():
-            if isinstance(channel, DcChannel):
-                self.configure_channel(id, configs)
-
-        probe_map = self.configure_channels(configs, sequence.channels)
-        self.register_pulses(configs, sequence)
-        acquisitions = self.register_acquisitions(configs, sequence, options)
-
-        args = ExecutionArguments(sequence, acquisitions, options.relaxation_time)
-        self.preprocess_sweeps(sweepers, configs, args, probe_map)
-        experiment = program(args, options, sweepers)
-
-        if self.script_file_name is not None:
-            script = generate_qua_script(experiment, asdict(self.config))
-            with open(self.script_file_name, "w") as file:
-                file.write(script)
-
-        if self.manager is None:
-            warnings.warn(
-                "Not connected to Quantum Machines. Returning program and config."
+            new_experiment = Experiment(
+                configs={
+                    ch: configs[ch] for ch in configs.keys() & self.channels.keys()
+                },
+                sequences=batched_sequences,
+                sweepers=sweepers,
             )
-            return {"program": experiment, "config": asdict(self.config)}
 
-        result = self.execute_program(experiment)
-        return fetch_results(result, acquisitions.values())
+            if True:  # TODO: new_experiment != self.experiment or self.manager is None:
+                # register DC elements so that all qubits are
+                # sweetspot even when they are not used
+                for id, channel in self.channels.items():
+                    if isinstance(channel, DcChannel):
+                        self.configure_channel(id, configs)
+
+                probe_map = self.configure_channels(configs, sequence.channels)
+                self.register_pulses(configs, sequence)
+                acquisitions = self.register_acquisitions(configs, sequence, options)
+
+                args = ExecutionArguments(
+                    sequence, acquisitions, options.relaxation_time
+                )
+                self.preprocess_sweeps(sweepers, configs, args, probe_map)
+                qua_program = program(args, options, sweepers)
+
+                if self.script_file_name is not None:
+                    script = generate_qua_script(qua_program, asdict(self.config))
+                    with open(self.script_file_name, "w") as file:
+                        file.write(script)
+
+                if self.manager is None:
+                    warnings.warn(
+                        "Not connected to Quantum Machines. Returning program and config."
+                    )
+                    return {"program": qua_program, "config": asdict(self.config)}
+
+                machine = self.manager.open_qm(asdict(self.config))
+                program_id = machine.compile(qua_program)
+                self.cache = Cache(
+                    machine=machine, program_id=program_id, acquisitions=acquisitions
+                )
+                self.experiment = new_experiment
+
+            pending_job = self.cache.run()
+            job = pending_job.wait_for_execution()
+            handles = job.result_handles
+            handles.wait_for_all_values()  # for async replace with ``handles.is_processing()``
+            results |= fetch_results(handles, self.cache.acquisitions.values())
+        return results
