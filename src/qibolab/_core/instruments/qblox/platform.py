@@ -1,6 +1,5 @@
 import re
 from collections import defaultdict
-from typing import Optional, Union
 
 from qibolab._core.components.channels import (
     AcquisitionChannel,
@@ -25,7 +24,7 @@ def _chtype(mod: str, input: bool) -> tuple[str, type[Channel]]:
     raise ValueError
 
 
-def _port_channels(mod: str, port: Union[int, str], slot: int) -> dict:
+def _port_channels(mod: str, port: int | str, slot: int) -> dict:
     if isinstance(port, str) and port.startswith("io"):
         return {
             "probe": IqChannel(path=f"{slot}/o{port[2:]}"),
@@ -48,7 +47,7 @@ def _premap(cluster: dict):
     return d
 
 
-def map_ports(cluster: dict, qubits: dict, couplers: Optional[dict] = None) -> dict:
+def map_ports(cluster: dict, qubits: dict, couplers: dict | None = None) -> dict:
     """Extract channels from compact representation.
 
     Conventions:
@@ -107,23 +106,31 @@ def _digits(string: str) -> QubitId:
     return _qubit_id(res[1]) if res is not None else ""
 
 
-def _out_port(port: Union[str, int]) -> QubitId:
+def _out_port(port: str | int) -> QubitId:
     return port if isinstance(port, int) else _digits(port)
 
 
-def infer_los(cluster: dict) -> dict[tuple[QubitId, bool], str]:
-    """Infer LOs names for output channels.
-
-    ``cluster`` should be a mapping compatible with the same input of :func:`map_ports`.
+def _infer_outputs(cluster: dict, suffix: str) -> dict[tuple[QubitId, bool], str]:
+    """``cluster`` should be a mapping compatible with the same input of :func:`map_ports`.
 
     The result is a mapping from ``(qubit, channel)``, where ``qubit`` is the identifier,
     and ``channel`` is a boolean toggle: ``True`` for probe channels, ``False`` for
     drive.
     """
     return {
-        (q, "qrm" in mod): f"{mod}/o{_out_port(port)}/lo"
+        (q, "qrm" in mod): f"{mod}/o{_out_port(port)}/{suffix}"
         for mod, specs in cluster.items()
         if "_rf" in mod
         for port, qs in specs[1].items()
         for q in qs
     }
+
+
+def infer_los(cluster: dict) -> dict[tuple[QubitId, bool], str]:
+    """Infer LOs names for output channels."""
+    return _infer_outputs(cluster, "lo")
+
+
+def infer_mixers(cluster: dict) -> dict[tuple[QubitId, bool], str]:
+    """Infer mixer names for output channels."""
+    return _infer_outputs(cluster, "mixer")

@@ -1,32 +1,37 @@
 import json
-from typing import Optional, cast
+from typing import cast
 
 import numpy as np
 from pydantic import ConfigDict
-from qblox_instruments.qcodes_drivers.module import Module
 from qblox_instruments.qcodes_drivers.sequencer import Sequencer
 
 from qibolab._core.components.channels import Channel, IqChannel
 from qibolab._core.components.configs import (
     AcquisitionConfig,
     Configs,
-    DcConfig,
     IqConfig,
+    IqMixerConfig,
     OscillatorConfig,
 )
 from qibolab._core.execution_parameters import AcquisitionType
 from qibolab._core.identifier import ChannelId
 from qibolab._core.serialize import Model
 
+from ..q1asm.ast_ import Acquire, Line
 from ..sequence import Q1Sequence
 from .port import PortAddress
 
 __all__ = []
 
 
-def _integration_length(sequence: Q1Sequence) -> Optional[int]:
+def _integration_length(sequence: Q1Sequence) -> int | None:
     """Find integration length based on sequence waveform lengths."""
-    lengths = {len(waveform.data) for waveform in sequence.waveforms.values()}
+    lengths = {
+        line.instruction.duration
+        for line in sequence.program.elements
+        if isinstance(line, Line)
+        if isinstance(line.instruction, Acquire)
+    }
     if len(lengths) == 0:
         return None
     if len(lengths) == 1:
@@ -41,49 +46,38 @@ class SequencerConfig(Model):
     # static validation
     model_config = ConfigDict(frozen=False)
 
-    module: dict
-    address: Optional[str] = None
+    address: str | None = None
     # the following attributes are automatically processed and set
-    sequence: Optional[dict] = None
-    sync_en: Optional[bool] = None
-    offset_awg_path0: Optional[float] = None
-    offset_awg_path1: Optional[float] = None
-    marker_ovr_en: Optional[bool] = None
-    marker_ovr_value: Optional[int] = None
-    integration_length_acq: Optional[int] = None
-    thresholded_acq_rotation: Optional[float] = None
-    thresholded_acq_threshold: Optional[float] = None
-    demod_en_acq: Optional[bool] = None
-    nco_freq: Optional[int] = None
-    mod_en_awg: Optional[bool] = None
+    sequence: dict | None = None
+    sync_en: bool | None = None
+    offset_awg_path0: float | None = None
+    offset_awg_path1: float | None = None
+    marker_ovr_en: bool | None = None
+    marker_ovr_value: int | None = None
+    integration_length_acq: int | None = None
+    thresholded_acq_rotation: float | None = None
+    thresholded_acq_threshold: float | None = None
+    demod_en_acq: bool | None = None
+    nco_freq: int | None = None
+    mod_en_awg: bool | None = None
+    mixer_corr_gain_ratio: float | None = None
+    mixer_corr_phase_offset_degree: float | None = None
 
     @classmethod
     def build(
         cls,
         address: PortAddress,
-        sequence: Q1Sequence,
         channel_id: ChannelId,
         channels: dict[ChannelId, Channel],
         configs: Configs,
         acquisition: AcquisitionType,
-        index: int,
         rf: bool,
+        sequence: Q1Sequence | None = None,
     ) -> "SequencerConfig":
-        module = {}
         config = configs[channel_id]
-
-        # set parameters
-        # offsets
-        if isinstance(config, DcConfig):
-            module[f"out{index}_offset"] = config.offset
-
-        # avoid sequence operations for inactive sequencers, including synchronization
-        if sequence.is_empty:
-            return cls(module=module)
 
         # conditional configurations
         cfg = cls(
-            module=module,
             # connect to physical address
             address=address.local_address,
             # TODO: mixer calibration not yet propagated
@@ -95,7 +89,9 @@ class SequencerConfig(Model):
             marker_ovr_value=15,
             # upload sequence
             # - ensure JSON compatibility of the sent dictionary
-            sequence=json.loads(sequence.model_dump_json()),
+            sequence=(
+                json.loads(sequence.model_dump_json()) if sequence is not None else None
+            ),
             # configure the sequencers to synchronize
             sync_en=True,
             # modulation, only disable for QCM - always used for flux pulses
@@ -105,14 +101,16 @@ class SequencerConfig(Model):
         # acquisition
         if address.input:
             assert isinstance(config, AcquisitionConfig)
-            length = _integration_length(sequence)
+            length = _integration_length(sequence) if sequence is not None else None
             if length is not None:
                 cfg.integration_length_acq = length
             # discrimination
             if config.iq_angle is not None:
                 cfg.thresholded_acq_rotation = np.degrees(config.iq_angle % (2 * np.pi))
-            if config.threshold is not None:
-                cfg.thresholded_acq_threshold = config.threshold
+            if config.threshold is not None and length is not None:
+                # threshold needs to be compensated by length
+                # see: https://docs.qblox.com/en/main/api_reference/sequencer.html#Sequencer.thresholded_acq_threshold
+                cfg.thresholded_acq_threshold = config.threshold * length
             # demodulation
             cfg.demod_en_acq = acquisition is not AcquisitionType.RAW
 
@@ -123,26 +121,25 @@ class SequencerConfig(Model):
         probe = channels[channel_id].iqout(channel_id)
         if probe is not None:
             freq = cast(IqConfig, configs[probe]).frequency
-            lo = cast(IqChannel, channels[probe]).lo
-            assert lo is not None
-            lo_freq = cast(OscillatorConfig, configs[lo]).frequency
+            probe_ = cast(IqChannel, channels[probe])
+            assert probe_.lo is not None
+            lo_freq = cast(OscillatorConfig, configs[probe_.lo]).frequency
             cfg.nco_freq = int(freq - lo_freq)
+            assert probe_.mixer is not None
+            mixer = cast(IqMixerConfig, configs[probe_.mixer])
+            cfg.mixer_corr_gain_ratio = mixer.scale_q
+            cfg.mixer_corr_phase_offset_degree = mixer.phase_q
 
         return cfg
 
     def apply(self, seq: Sequencer):
         """Configure sequencer-wide settings."""
-
-        mod = cast(Module, seq.ancestors[1])
-        for name, value in self.module.items():
-            mod.set(name, value)
-
         if self.address is not None:
             seq.connect_sequencer(self.address)
 
         # values already applied
-        applied = {"module", "address"}
+        applied = {"address"}
         for name in self.model_fields_set - applied:
             value = getattr(self, name)
             if value is not None:
-                seq.set(name, value)
+                seq.parameters[name].set(value)

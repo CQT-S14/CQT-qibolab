@@ -1,32 +1,149 @@
+import logging
 import time
+import warnings
 from collections import defaultdict
 from functools import cached_property
 from itertools import groupby
-from typing import Optional, cast
+from typing import cast
 
 import qblox_instruments as qblox
 from qblox_instruments.qcodes_drivers.module import Module
 from qcodes.instrument import find_or_create_instrument
 
-from qibolab._core.components import AcquisitionChannel, Configs, IqChannel
-from qibolab._core.execution_parameters import AcquisitionType, ExecutionParameters
+from qibolab._core.components import (
+    AcquisitionChannel,
+    Configs,
+    DcChannel,
+    DcConfig,
+    IqChannel,
+)
+from qibolab._core.execution_parameters import (
+    AcquisitionType,
+    ExecutionParameters,
+)
 from qibolab._core.identifier import ChannelId, Result
 from qibolab._core.instruments.abstract import Controller
+from qibolab._core.pulses.pulse import PulseId, Readout
 from qibolab._core.sequence import PulseSequence
-from qibolab._core.sweeper import ParallelSweepers
+from qibolab._core.serialize import Model
+from qibolab._core.sweeper import ParallelSweepers, Parameter, normalize_sweepers
 
 from . import config
+from .batching import batch_sequences_by_cluster_memory_limits
 from .config import PortAddress
 from .identifiers import SequencerMap, SlotId
 from .log import Logger
-from .results import AcquiredData, extract, integration_lenghts
+from .results import AcquiredData, extract, integration_lengths
 from .sequence import Q1Sequence, compile
-from .utils import batch_shots, concat_shots, lo_configs, time_of_flights
-from .validate import assert_channels_exclusion, validate_sequence
+from .utils import (
+    batch_shots,
+    concat_shots,
+    lo_configs,
+    time_of_flights,
+)
+from .validate import (
+    assert_channels_exclusion,
+    validate_sequence,
+)
+
+logger = logging.getLogger(__name__)
+
 
 __all__ = ["Cluster"]
 
 SAMPLING_RATE = 1
+
+
+def _compute_duration(
+    ps: PulseSequence,
+    sweepers: list[ParallelSweepers],
+    options: ExecutionParameters,
+    configs: Configs,
+) -> float:
+    """Compute the total program duration including time of flight and
+    synchronization waiting time.
+    """
+
+    # TODO: include the time of flight calculation at the level of
+    # Platform.execute rather than in the qblox driver. This will require
+    # propagating the changes also to qibocal.
+    time_of_flight = max(
+        [time_of_flights(configs)[ch[0]] for ch in ps if hasattr(ch[1], "acquisition")],
+        default=0.0,
+    )
+
+    # TODO: wait_sync duration is determined as explained in this comment
+    # https://github.com/qiboteam/qibolab/pull/1389#issuecomment-3884129213.
+    # It should be checked with Qblox if the sync time can indeed be of the
+    # order of 900 ns.
+    wait_sync_duration = 900
+    duration = options.estimate_duration(
+        [ps], sweepers, time_of_flight + wait_sync_duration
+    )
+    return duration
+
+
+def _add_time_of_flight(sequence: PulseSequence, configs: Configs) -> PulseSequence:
+    time_of_flights_ = time_of_flights(configs)
+    return PulseSequence(
+        [
+            (
+                ch,
+                ev
+                if not isinstance(ev, Readout)
+                else ev.model_copy(update={"time_of_flight": time_of_flights_[ch]}),
+            )
+            for ch, ev in sequence
+        ]
+    )
+
+
+def _batch_sequences(
+    sequences: list[PulseSequence],
+    sweepers: list[ParallelSweepers],
+    options: ExecutionParameters,
+    qcm_channels: set[ChannelId],
+    qrm_channels: set[ChannelId],
+    configs: Configs,
+) -> list[PulseSequence]:
+    batched_seqs = (
+        batch_sequences_by_cluster_memory_limits(
+            sequences,
+            sweepers,
+            options,
+            qcm_channels,
+            qrm_channels,
+        )
+        if options.averaging_mode.average
+        else sequences
+    )
+    return [_add_time_of_flight(b, configs).align_to_delays() for b in batched_seqs]
+
+
+def _merge_phases_if_no_phase_sweeper(
+    sweepers: list[ParallelSweepers],
+    sequences: list[PulseSequence],
+) -> tuple[list[PulseSequence], bool]:
+    """
+    Process pulse sequences based on the presence of phase sweepers.
+
+    If any sweeper in the provided list is a phase or relative_phase sweeper,
+    the sequences are returned unchanged. Otherwise, the phases in the sequences
+    are summed to simplify the pulse sequences.
+    """
+    phase_sweeper_present = any(
+        sweeper.parameter in {Parameter.relative_phase, Parameter.phase}
+        for parallel_sweepers in sweepers
+        for sweeper in parallel_sweepers
+    )
+    return [
+        ps if phase_sweeper_present else ps.to_vzs().collect_vzs() for ps in sequences
+    ], phase_sweeper_present
+
+
+class ClusterConfigs(Model):
+    modules: dict[int, config.ModuleConfig]
+    sequencers: dict[int, dict[int, config.SequencerConfig]]
 
 
 class Cluster(Controller):
@@ -38,8 +155,7 @@ class Cluster(Controller):
     As described in:
     https://docs.qblox.com/en/main/getting_started/setup.html#connecting-to-multiple-instruments
     """
-    bounds: str = "qblox/bounds"
-    _cluster: Optional[qblox.Cluster] = None
+    _cluster: qblox.Cluster | None = None
 
     @property
     def cluster(self) -> qblox.Cluster:
@@ -60,7 +176,12 @@ class Cluster(Controller):
         """Determine connections status."""
         return self._cluster is not None
 
-    def connect(self):
+    def reset(self) -> None:
+        """Reset cluster parameters."""
+        assert self._cluster is not None
+        self._cluster.reset()
+
+    def connect(self) -> None:
         """Connect and initialize the instrument."""
         if self.is_connected:
             return
@@ -68,17 +189,33 @@ class Cluster(Controller):
         self._cluster = find_or_create_instrument(
             qblox.Cluster, recreate=True, name=self.name, identifier=self.address
         )
-        self._cluster.reset()
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Disconnect and reset the instrument."""
         assert self._cluster is not None
 
+        # Ensure static flux offsets are reset before closing the connection to avoid
+        # heating the fridge.
+        self._set_dc_offsets_to_0()
+
         for module in self._modules.values():
             module.stop_sequencer()
-        self._cluster.reset()
         self._cluster.close()
         self._cluster = None
+
+    def _set_dc_offsets_to_0(self) -> None:
+        flux_slot_to_ports: dict[SlotId, set[int]] = defaultdict(set)
+        for channel in self.channels.values():
+            if not isinstance(channel, DcChannel):
+                continue
+            address = PortAddress.from_path(channel.path)
+            flux_slot_to_ports[address.slot].add(address.ports[0] - 1)
+
+        for slot, ports in flux_slot_to_ports.items():
+            module = self._modules[slot]
+            for port in ports:
+                offset_parameter = f"out{port}_offset"
+                module.parameters[offset_parameter].set(0.0)
 
     def play(
         self,
@@ -86,54 +223,93 @@ class Cluster(Controller):
         sequences: list[PulseSequence],
         options: ExecutionParameters,
         sweepers: list[ParallelSweepers],
-    ) -> dict[int, Result]:
+    ) -> dict[PulseId, Result]:
         """Execute the given experiment."""
-        results = {}
-        log = Logger(configs)
 
-        # no unrolling yet: act one sequence at a time, and merge results
-        for ps in sequences:
-            # split shots in batches, in case the required experiment exceeds the
-            # allowed memory
+        self.reset()
+
+        processed_sequences, phase_sweeper_present = _merge_phases_if_no_phase_sweeper(
+            sweepers, sequences
+        )
+
+        # If acquisition is cyclic (averaging over shots on hardware), we combine as
+        # many sequences as possible in a single batch, according to the cluster
+        # memory limits.
+        qrm_slots = {
+            slot for slot, module in self._modules.items() if module.is_qrm_type
+        }
+        qrm_channels = {
+            channelid
+            for channelid, channelobj in self.channels.items()
+            if PortAddress.from_path(channelobj.path).slot in qrm_slots
+        }
+        qcm_channels = set(self.channels) - qrm_channels
+        batched_seqs = _batch_sequences(
+            processed_sequences, sweepers, options, qcm_channels, qrm_channels, configs
+        )
+
+        sweepers_ = normalize_sweepers(
+            sweepers,
+            lo_configs(self._los, configs),
+            {
+                ch: cfg.offset
+                for ch, cfg in configs.items()
+                if isinstance(cfg, DcConfig)
+            },
+        )
+
+        # configure the modules
+        _module_configs = self._configure_modules(configs)
+
+        # Execute each batch sequentially, and concatenate results
+        log = Logger(configs)
+        results = {}
+        for ps in batched_seqs:
             psres = []
             for shots in batch_shots(ps, sweepers, options):
                 options_ = options.model_copy(update={"nshots": shots})
+
                 # first compile pulses and sweepers into Qblox sequences
                 assert_channels_exclusion(ps, self._probes)
                 sequences_ = compile(
                     ps,
-                    sweepers,
+                    sweepers_,
                     options_,
                     self.sampling_rate,
-                    lo_configs(self._los, configs),
-                    time_of_flights(configs),
+                    merged_vzs=not phase_sweeper_present,
                 )
-                for seq in sequences_.values():
-                    validate_sequence(seq)
+
+                for channelid, seq in sequences_.items():
+                    slot = PortAddress.from_path(self.channels[channelid].path).slot
+                    validate_sequence(seq, self._modules[slot].is_qrm_type)
+
                 log.sequences(sequences_)
 
-                # then configure modules and sequencers
-                # (including sequences upload)
-                sequencers = self._configure(
-                    sequences_, configs, options.acquisition_type
+                # then configure sequencers (including sequences upload)
+                self._disconnect_and_desync_sequencers()
+                sequencers, _sequencer_configs = self._configure_sequencers(
+                    configs=configs,
+                    acquisition=options_.acquisition_type,
+                    sequences=sequences_,
                 )
                 log.status(self.cluster, sequencers)
 
                 # finally execute the experiment, and fetch results
-                duration = options.estimate_duration([ps], sweepers)
+                duration = _compute_duration(ps, sweepers_, options_, configs)
+                logger.info(f"Qblox expected execution time: {duration:.3f} s")
                 data = self._execute(
-                    sequencers, sequences_, duration, options.acquisition_type
+                    sequencers, sequences_, duration, options_.acquisition_type
                 )
                 log.data(data)
 
                 # process raw results to adhere to standard format
-                lenghts = integration_lenghts(sequences_, sequencers, self._modules)
+                lengths = integration_lengths(sequences_, sequencers, self._modules)
                 psres.append(
                     extract(
                         data,
-                        lenghts,
+                        lengths,
                         options_.acquisition_type,
-                        options_.results_shape(sweepers),
+                        options_.results_shape(sweepers_),
                     )
                 )
 
@@ -141,18 +317,68 @@ class Cluster(Controller):
             results |= concat_shots(psres, options)
         return results
 
-    def _configure(
-        self,
-        sequences: dict[ChannelId, Q1Sequence],
-        configs: Configs,
-        acquisition: AcquisitionType,
-    ) -> SequencerMap:
-        """Configure modules and sequencers.
+    def _disconnect_and_desync_sequencers(self) -> None:
+        """Clear the relevant module settings before applying a new sequence."""
+        # see FAQ in docs for disconnect_outputs() and disconnect_inputs()
+        # https://docs.qblox.com/en/v2025.12.0/products/qblox_instruments/faq.html
+        for module in self._modules.values():
+            # Disconnect outputs because `SequencerConfig.apply` creates new connections
+            # between the indexed sequencer and various inputs/outputs. Existing
+            # connections would otherwise cause the operation to fail.
+            module.disconnect_outputs()
+            if module.is_qrm_type:
+                module.disconnect_inputs()
 
-        The return value consists of the association map from channels
-        to sequencers, for each module.
+            for seq in module.sequencers:
+                # Disable synchronization. This is needed because different
+                # sequences may use different sequencers, and if a previous sequence
+                # used a sequencer that is not used in the current one, it can cause
+                # an indefinite wait during `wait_sync`.
+                seq.sync_en(False)
+
+    def _configure_modules(self, configs: Configs) -> dict[SlotId, config.ModuleConfig]:
+        """Configure module settings (e.g. LOs, Mixers).
+
+        Returns a dictionary mapping slots to their respective ModuleConfig.
+        """
+        modcfgs = {}
+        for slot, chs in self._channels_by_module.items():
+            module = self._modules[slot]
+            ids = {id for id, _ in chs}
+            channels = {id: ch for id, ch in self.channels.items() if id in ids}
+            los = config.module.los(self._los, configs, ids)
+            mixers = config.module.mixers(self._mixers, configs, ids)
+            modcfg = modcfgs[slot] = config.ModuleConfig.build(
+                channels, configs, los, mixers
+            )
+            modcfg.apply(module)
+        return modcfgs
+
+    def _configure_sequencers(
+        self,
+        configs: Configs,
+        acquisition: AcquisitionType = AcquisitionType.INTEGRATION,
+        sequences: dict[ChannelId, Q1Sequence] | None = None,
+    ) -> tuple[SequencerMap, dict[SlotId, dict[int, config.SequencerConfig]]]:
+        """Configure sequencers.
+
+        The return value consists of the association map from channels to sequencers,
+        for each module. And the sequencer configurations.
+
+        For configuration testing purpose, it is possible to also configure sequencers
+        with no sequence provided. In which case, it will attempt to assign sequencers
+        to all available channels (as opposed to just those involved in the experiment,
+        and thus in the sequences). For the sake of simplifying the usage of this
+        function, a default acquisition type is provided
+        (:attr:`AcquisitionType.INTEGRATION`). The only true alternative to this value
+        is :attr:`AcquisitionType.RAW`, since further configurations are required to
+        operate in scope mode.
         """
         sequencers = defaultdict(dict)
+        exec_mode = sequences is not None
+        sequences_ = defaultdict(lambda: None, sequences if exec_mode else {})
+
+        seqcfgs = {}
         for slot, chs in self._channels_by_module.items():
             module = self._modules[slot]
 
@@ -160,26 +386,50 @@ class Cluster(Controller):
             # not be outnumbered
             assert len(module.sequencers) >= len(chs)
 
-            # compute module configurations, and apply them
-            los = config.module.los(self._los, configs, chs)
-            config.ModuleConfig.compute(self.channels, los, module.is_qrm_type).apply(
-                module
-            )
-
-            # configure all sequencers, and store active ones' association to channels
-            rf = module.is_rf_type
+            # configure all sequencers, and store association to channels
+            seqcfgs[slot] = {}
             for idx, ((ch, address), sequencer) in enumerate(
                 zip(chs, module.sequencers)
             ):
-                seq = sequences.get(ch, Q1Sequence.empty())
-                config.SequencerConfig.build(
-                    address, seq, ch, self.channels, configs, acquisition, idx, rf
-                ).apply(sequencer)
-                # only collect active sequencers
-                if not seq.is_empty:
-                    sequencers[slot][ch] = idx
+                # Only configure and register sequencer for active channels. For passive
+                # channels the sequencer operations are not relevant, e.g. a flux
+                # channel with no registered pulse will still set an offset, but this
+                # will happen at port level, and it is consumed in the `ModuleConfig` if
+                # not in execution mode, configure all channels, to test the
+                # configuration itself.
+                if exec_mode and ch not in sequences:
+                    continue
 
-        return sequencers
+                seqcfg = seqcfgs[slot][idx] = config.SequencerConfig.build(
+                    address,
+                    ch,
+                    self.channels,
+                    configs,
+                    acquisition,
+                    module.is_rf_type,
+                    sequence=sequences_[ch],
+                )
+                seqcfg.apply(sequencer)
+                # populate channel-to-sequencer mapping
+                sequencers[slot][ch] = idx
+
+        return sequencers, seqcfgs
+
+    def configure(
+        self,
+        configs: Configs,
+        acquisition: AcquisitionType = AcquisitionType.INTEGRATION,
+        sequences: dict[ChannelId, Q1Sequence] | None = None,
+    ) -> tuple[SequencerMap, ClusterConfigs]:
+        """
+        .. deprecated:: 0.2.16
+            Use `configure_sequencers` and/or `_configure_modules` instead.
+        """
+        modules_configs = self._configure_modules(configs)
+        sequencers, seqcfgs = self._configure_sequencers(
+            configs, acquisition, sequences
+        )
+        return sequencers, ClusterConfigs(modules=modules_configs, sequencers=seqcfgs)
 
     def _execute(
         self,
@@ -196,8 +446,8 @@ class Cluster(Controller):
                 module.arm_sequencer(seq)
             module.start_sequencer()
 
-        # approximately wait for experiment completion
-        time.sleep(duration + 1)
+        # wait for experiment completion
+        time.sleep(duration)
 
         # fetch acquired results
         acquisitions = {}
@@ -205,8 +455,10 @@ class Cluster(Controller):
             for ch, seq in seqs.items():
                 # wait all sequencers
                 status = self.cluster.get_sequencer_status(slot, seq, timeout=1)
-                if status.status is not qblox.SequencerStatuses.OKAY:
-                    raise RuntimeError(status)
+                if status.status is qblox.SequencerStatuses.ERROR:
+                    raise RuntimeError(f"slot: {slot}, seq: {seq}\n{status}")
+                if status.status is qblox.SequencerStatuses.WARNING:
+                    warnings.warn(f"slot: {slot}, seq: {seq}\n{status}")
 
                 # skip results retrieval for passive or inactive sequencers...
                 sequence = sequences.get(ch)
@@ -218,7 +470,11 @@ class Cluster(Controller):
                     continue
 
                 # ensure acquisition status, and fetch results
-                self.cluster.get_acquisition_status(slot, seq, timeout=1)
+                acq_status = self.cluster.get_acquisition_status(slot, seq, timeout=1)
+                if acq_status is False:
+                    raise RuntimeError(
+                        f"Acquisition not completed. slot: {slot}, seq: {seq}."
+                    )
                 if acquisition is AcquisitionType.RAW:
                     for name in seq_acqs:
                         self.cluster.store_scope_acquisition(slot, seq, str(name))
@@ -226,7 +482,7 @@ class Cluster(Controller):
 
         return acquisitions
 
-    @cached_property
+    @property
     def _modules(self) -> dict[SlotId, Module]:
         """Retrieve slot to module object mapping."""
         return {mod.slot_idx: mod for mod in self.cluster.modules if mod.present()}
@@ -275,8 +531,23 @@ class Cluster(Controller):
             ch: lo
             for ch, lo in (
                 (ch, cast(IqChannel, channels[iq]).lo)
-                for ch, iq in ((ch, channels[ch].iqout(ch)) for ch in self.channels)
+                for ch, iq in ((ch, channels[ch].iqout(ch)) for ch in channels)
                 if iq is not None
             )
             if lo is not None
+        }
+
+    @cached_property
+    def _mixers(self) -> dict[ChannelId, str]:
+        """Extract channel to mixer mapping."""
+        # TODO: identical to the `._los` property, deduplicate it please...
+        channels = self.channels
+        return {
+            ch: mix
+            for ch, mix in (
+                (ch, cast(IqChannel, channels[iq]).mixer)
+                for ch, iq in ((ch, channels[ch].iqout(ch)) for ch in channels)
+                if iq is not None
+            )
+            if mix is not None
         }

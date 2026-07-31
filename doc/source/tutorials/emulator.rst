@@ -1,3 +1,10 @@
+.. admonition:: Work in progress
+
+    This page is only partially updated from a previous version of Qibolab.
+
+    In case of doubts, contact the `Qibo developers
+    <https://github.com/qiboteam/qibo#contacts>`_.
+
 How to emulate a QPU using Qibolab?
 ===================================
 
@@ -14,19 +21,13 @@ platform. All parameters related to the Hamiltonian to be simulated are coded di
 the section ``configs``. Here is an example
 
 
-.. collapse:: Parameters dictionary
+.. dropdown:: Parameters dictionary
 
     .. testcode::  python
 
         parameters = {
             "settings": {"nshots": 1024, "relaxation_time": 0},
             "configs": {
-                "emulator/bounds": {
-                    "kind": "bounds",
-                    "waveforms": 1000000,
-                    "readout": 50,
-                    "instructions": 200,
-                },
                 "hamiltonian": {
                     "transmon_levels": 2,
                     "qubits": {
@@ -44,12 +45,12 @@ the section ``configs``. Here is an example
                 "0/drive": {
                     "kind": "drive-emulator",
                     "frequency": 5e9,
-                    "scale_factor": 0.1591549,
+                    "rabi_frequency": 159154900.0,
                 },
                 "0/drive12": {
                     "kind": "drive-emulator",
                     "frequency": 4.8e9,
-                    "scale_factor": 0.1591549,
+                    "rabi_frequency": 159154900.0,
                 },
                 "0/flux": {"kind": "flux-emulator", "offset": 0.02},
                 "0/probe": {"kind": "iq", "frequency": 5200000000.0},
@@ -124,7 +125,15 @@ We are now going to give an example on how to setup the `platform.py` file.
 
 .. testcode::  python
 
-    from qibolab import ConfigKinds, DcChannel, IqChannel, Platform, Qubit, Hardware
+    from qibolab import (
+        AcquisitionChannel,
+        ConfigKinds,
+        DcChannel,
+        Hardware,
+        IqChannel,
+        Platform,
+        Qubit,
+    )
     from qibolab.instruments.emulator import (
         DriveEmulatorConfig,
         EmulatorController,
@@ -143,6 +152,8 @@ We are now going to give an example on how to setup the `platform.py` file.
         for q in range(1):
             qubits[q] = qubit = Qubit.default(q)
             channels |= {
+                qubit.probe: IqChannel(mixer=None, lo=None),
+                qubit.acquisition: AcquisitionChannel(probe=qubit.probe),
                 qubit.drive: IqChannel(mixer=None, lo=None),
                 qubit.flux: DcChannel(),
             }

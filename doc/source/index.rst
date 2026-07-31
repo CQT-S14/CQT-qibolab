@@ -58,6 +58,7 @@ Contents
     main-documentation/experiment
     main-documentation/drivers
     main-documentation/compiler
+    main-documentation/circuits
 
 .. toctree::
     :maxdepth: 2
@@ -87,6 +88,7 @@ Contents
     :maxdepth: 2
     :caption: Appendix
 
+    references
     Publications <https://qibo.science/qibo/stable/appendix/citing-qibo.html>
 
 .. toctree::

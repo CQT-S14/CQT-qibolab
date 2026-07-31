@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from collections.abc import Mapping
 
 from pydantic import ConfigDict, Field
+
+from qibolab._core.pulses.pulse import PulseId
 
 from ..components import Channel, Config
 from ..execution_parameters import ExecutionParameters
@@ -9,6 +11,13 @@ from ..identifier import ChannelId, Result
 from ..sequence import PulseSequence
 from ..serialize import Model
 from ..sweeper import ParallelSweepers
+
+__all__ = [
+    "Controller",
+    "Instrument",
+    "InstrumentId",
+    "InstrumentMap",
+]
 
 InstrumentId = str
 
@@ -29,7 +38,7 @@ class Instrument(Model, ABC):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=False, extra="allow")
 
     address: str
-    settings: Optional[InstrumentSettings] = None
+    settings: InstrumentSettings | None = None
 
     @property
     def signature(self):
@@ -52,18 +61,21 @@ class Instrument(Model, ABC):
         """
 
 
+InstrumentMap = Mapping[InstrumentId, Instrument]
+
+
 class Controller(Instrument):
     """Instrument that can play pulses (using waveform generator)."""
 
-    bounds: str
-    """Estimated limitations of the device memory."""
     channels: dict[ChannelId, Channel] = Field(default_factory=dict)
 
     @property
     @abstractmethod
-    def sampling_rate(self) -> int:
-        """Sampling rate of control electronics in giga samples per second
-        (GSps)."""
+    def sampling_rate(self) -> float:
+        """Sampling rate of control electronics.
+
+        Expressed in giga samples per second (GSps).
+        """
 
     @abstractmethod
     def play(
@@ -72,7 +84,7 @@ class Controller(Instrument):
         sequences: list[PulseSequence],
         options: ExecutionParameters,
         sweepers: list[ParallelSweepers],
-    ) -> dict[int, Result]:
+    ) -> dict[PulseId, Result]:
         """Play a pulse sequence and retrieve feedback.
 
         If :class:`qibolab.Sweeper` objects are passed as arguments, they are

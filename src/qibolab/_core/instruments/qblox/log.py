@@ -1,5 +1,8 @@
+import json
+import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from qblox_instruments import Cluster
 
@@ -13,7 +16,7 @@ from .sequence import Q1Sequence
 __all__ = []
 
 
-def _check(configs: Configs) -> Optional[Path]:
+def _check(configs: Configs) -> Path | None:
     if "log" in configs:
         assert isinstance(configs["log"], LogConfig)
         return configs["log"].path
@@ -21,6 +24,14 @@ def _check(configs: Configs) -> Optional[Path]:
 
 def _sanitize(name: str) -> str:
     return name.replace("/", "-")
+
+
+@contextmanager
+def _dump_stdout(path):
+    original_stdout = sys.stdout
+    with open(path, "w") as sys.stdout:
+        yield
+    sys.stdout = original_stdout
 
 
 class Logger:
@@ -42,7 +53,11 @@ class Logger:
         status = self.path / "status"
         status.mkdir(exist_ok=True)
 
-        (status / "cluster.json").write_text(str(cluster.snapshot()))
+        (status / "cluster.json").write_text(json.dumps(cluster.snapshot()))
+
+        with _dump_stdout(status / "cluster.txt"):
+            cluster.print_readable_snapshot()
+
         for slot, seqs in sequencers.items():
             for ch, seq_idx in seqs.items():
                 (status / _sanitize(f"{ch}.log")).write_text(

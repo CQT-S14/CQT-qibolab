@@ -1,5 +1,6 @@
-from typing import Literal, Union
+from typing import Any, Literal
 
+import numpy as np
 from pydantic import Field
 
 from qibolab._core.components import (
@@ -7,13 +8,14 @@ from qibolab._core.components import (
     DcConfig,
     OscillatorConfig,
 )
+from qibolab._core.components.filters import ExponentialFilter
 
 __all__ = [
+    "MwFemOscillatorConfig",
+    "OctaveOscillatorConfig",
     "OpxOutputConfig",
     "QmAcquisitionConfig",
     "QmConfigs",
-    "OctaveOscillatorConfig",
-    "MwFemOscillatorConfig",
 ]
 
 OctaveOutputModes = Literal[
@@ -21,6 +23,23 @@ OctaveOutputModes = Literal[
 ]
 
 DEFAULT_SAMPLING_RATE = 1e9
+
+DEFAULT_FEEDFORWARD_MAX = 2 - 2**-16
+"""Maximum feedforward tap value"""
+DEFAULT_FEEDBACK_MAX = 1 - 2**-20
+"""Maximum feedback tap value"""
+
+
+def normalize_feedforward(taps: list[float], threshold: float) -> list[float]:
+    """Feedforward coefficient normalization required by QM."""
+    scale = np.max(np.abs(taps) / threshold, initial=1)
+    return (np.array(taps) / scale).tolist()
+
+
+def normalize_feedback(taps: list[float], threshold: float) -> list[float]:
+    """Feedback coefficient normalization required by QM."""
+    new_taps = np.clip(taps, -threshold, threshold)
+    return new_taps.tolist()
 
 
 class OpxOutputConfig(DcConfig):
@@ -33,17 +52,38 @@ class OpxOutputConfig(DcConfig):
 
     Possible values are -0.5V to 0.5V.
     """
-    filter: dict[str, list[float]] = Field(default_factory=dict)
-    """FIR and IIR filters to be applied for correcting signal distortions.
-
-    See
-    https://docs.quantum-machines.co/1.1.7/qm-qua-sdk/docs/Guides/output_filter/?h=filter#output-filter
-    for more details.
-    Changing the filters affects the calibration of single shot discrimination (threshold and angle).
-    """
     output_mode: Literal["direct", "amplified"] = "direct"
     sampling_rate: float = DEFAULT_SAMPLING_RATE
     upsampling_mode: Literal["mw", "pulse"] = "mw"
+    feedback_max: float = Field(exclude=True, default=DEFAULT_FEEDBACK_MAX)
+    feedforward_max: float = Field(exclude=True, default=DEFAULT_FEEDFORWARD_MAX)
+
+    def filter(self, cluster: str) -> dict[str, list[float | tuple[float, float]]]:
+        if cluster == "opx1":
+            feedback_filters = [
+                -i.feedback[1] for i in self.filters if isinstance(i, ExponentialFilter)
+            ]
+            iir = {
+                "feedback": normalize_feedback(feedback_filters, self.feedback_max)
+                if len(feedback_filters) > 0
+                else []
+            }
+        elif cluster in {"opx1000", "LF", "MW"}:
+            iir = {
+                "exponential": [
+                    (filt.amplitude, filt.tau)
+                    for filt in self.filters
+                    if isinstance(filt, ExponentialFilter)
+                ]
+            }
+        else:
+            raise NotImplementedError(f"Cluster type {cluster} not yet supported")
+
+        return {
+            "feedforward": normalize_feedforward(self.feedforward, self.feedforward_max)
+            if len(self.feedforward) > 0
+            else []
+        } | iir
 
 
 class OctaveOscillatorConfig(OscillatorConfig):
@@ -55,7 +95,7 @@ class OctaveOscillatorConfig(OscillatorConfig):
 
 
 class QmAcquisitionConfig(AcquisitionConfig):
-    """Acquisition config for QM OPX+."""
+    """Acquisition config for QM."""
 
     kind: Literal["qm-acquisition"] = "qm-acquisition"
 
@@ -66,6 +106,13 @@ class QmAcquisitionConfig(AcquisitionConfig):
     """
     offset: float = 0.0
     """Constant voltage to be applied on the input."""
+
+    def model_post_init(self, context: Any) -> None:
+        # The minimum time-of-flight for QM is 28 ns, so we need to ensure that
+        # the delay is at least 28 ns (determined from QM error message during
+        # execution)
+        if self.delay < 28:
+            object.__setattr__(self, "delay", 28)
 
 
 class MwFemOscillatorConfig(OscillatorConfig):
@@ -84,9 +131,9 @@ class MwFemOscillatorConfig(OscillatorConfig):
     sampling_rate: float = DEFAULT_SAMPLING_RATE
 
 
-QmConfigs = Union[
-    OpxOutputConfig,
-    OctaveOscillatorConfig,
-    QmAcquisitionConfig,
-    MwFemOscillatorConfig,
-]
+QmConfigs = (
+    OpxOutputConfig
+    | OctaveOscillatorConfig
+    | QmAcquisitionConfig
+    | MwFemOscillatorConfig
+)

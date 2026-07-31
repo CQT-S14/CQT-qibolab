@@ -1,3 +1,10 @@
+.. admonition:: Work in progress
+
+    This page is only partially updated from a previous version of Qibolab.
+
+    In case of doubts, contact the `Qibo developers
+    <https://github.com/qiboteam/qibo#contacts>`_.
+
 .. _main_doc_experiment:
 
 Experiment
@@ -16,9 +23,7 @@ Qibolab offers a range of pre-defined pulse shapes which can be found in :py:mod
 - Exponential (:class:`qibolab.Exponential`)
 - Gaussian (:class:`qibolab.Gaussian`)
 - Drag (:class:`qibolab.Drag`)
-- IIR (:class:`qibolab.Iir`)
 - SNZ (:class:`qibolab.Snz`)
-- eCap (:class:`qibolab.ECap`)
 - Custom (:class:`qibolab.Custom`)
 
 To illustrate, here is an examples of how to instantiate a pulse using the Qibolab API:
@@ -62,7 +67,6 @@ To organize pulses into sequences, Qibolab provides the :class:`qibolab.PulseSeq
 
     from qibolab import Pulse, PulseSequence, Rectangular
 
-
     pulse1 = Pulse(
         duration=40,  # timing, in all qibolab, is expressed in ns
         amplitude=0.5,  # this amplitude is relative to the range of the instrument
@@ -87,12 +91,13 @@ To organize pulses into sequences, Qibolab provides the :class:`qibolab.PulseSeq
         relative_phase=0,  # phases are in radians
         envelope=Rectangular(),
     )
+    drive_channel_qubit0 = platform.qubits[0].drive
     sequence = PulseSequence(
         [
-            ("qubit/drive", pulse1),
-            ("qubit/drive", pulse2),
-            ("qubit/drive", pulse3),
-            ("qubit/drive", pulse4),
+            (drive_channel_qubit0, pulse1),
+            (drive_channel_qubit0, pulse2),
+            (drive_channel_qubit0, pulse3),
+            (drive_channel_qubit0, pulse4),
         ],
     )
 

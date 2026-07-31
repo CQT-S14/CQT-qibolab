@@ -1,5 +1,4 @@
 from collections.abc import Iterable, Sequence
-from typing import Optional
 
 from qibolab._core.execution_parameters import AveragingMode, ExecutionParameters
 from qibolab._core.identifier import ChannelId
@@ -11,6 +10,7 @@ from ..q1asm.ast_ import (
     Instruction,
     Line,
     Move,
+    Nop,
     Program,
     Stop,
     Wait,
@@ -53,6 +53,10 @@ def setup(
                 instruction=Move(source=0, destination=Registers.bin_reset.value),
                 comment="init bin reset",
             ),
+            Line(
+                instruction=Move(source=0, destination=Registers.phase_delta.value),
+                comment="init delta phase register",
+            ),
         ]
         + [
             Line(
@@ -69,11 +73,14 @@ def setup(
             for p in params
             if p.channel in channel or p.pulse in pulses
         ]
+        # wait one clock cycle before parameters' update
+        # cf. .loops._sweep_update()
+        + [Nop()]
         + [
             inst
             for p in params
             if p.channel in channel
-            for inst in update_instructions(p.role, p.start)
+            for inst in update_instructions(p.role, p.reg)
         ]
     )
 
@@ -93,13 +100,12 @@ def program(
     options: ExecutionParameters,
     sweepers: list[ParallelSweepers],
     channel: set[ChannelId],
-    time_of_flight: Optional[float],
     padding: int,
+    merged_vzs: bool,
 ) -> Program:
     """Generate sequencer program."""
     assert options.nshots is not None
     assert options.relaxation_time is not None
-
     loops_ = loops(
         sweepers,
         options.nshots,
@@ -108,12 +114,12 @@ def program(
     params_ = params(sweepers, allocated=max(lp.reg.number for lp in loops_))
     indexed_params = params_reshape(params_)
     sweepseq = sweep_sequence(
-        sequence, [p for v in indexed_params.values() for p in v[1]]
+        sequence, [p for v in indexed_params.values() for p in v.pulse]
     )
     experiment_ = [
-        *experiment(sweepseq, waveforms, acquisitions, time_of_flight),
-        # add 4 spare ns to ensure minimum duration
-        Wait(duration=padding + 4),
+        *experiment(sweepseq, waveforms, acquisitions, merged_vzs),
+        # Enforce a minimum wait of 4 ns corresponding to one clock cycle
+        Wait(duration=min(padding, 4)),
     ]
     singleshot = options.averaging_mode is AveragingMode.SINGLESHOT
     pulses = {p[0].id for p in sweepseq}

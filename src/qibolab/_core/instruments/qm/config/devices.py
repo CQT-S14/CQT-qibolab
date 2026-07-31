@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal, Union
+from typing import Literal
 
 from qibolab._core.components import OscillatorConfig
 
@@ -11,15 +11,15 @@ from ..components import (
 from ..components.configs import OctaveOutputModes
 
 __all__ = [
-    "ModuleTypes",
-    "MwFemOutput",
-    "MwFemInput",
-    "OctaveOutput",
-    "OctaveInput",
     "Controller",
-    "Octave",
     "ControllerId",
     "Controllers",
+    "ModuleTypes",
+    "MwFemInput",
+    "MwFemOutput",
+    "Octave",
+    "OctaveInput",
+    "OctaveOutput",
 ]
 
 
@@ -85,8 +85,8 @@ class OctaveOutput:
     output_mode: OctaveOutputModes = "triggered"
 
     @classmethod
-    def from_config(cls, config: Union[OscillatorConfig, OctaveOscillatorConfig]):
-        kwargs = dict(LO_frequency=config.frequency, gain=config.power)
+    def from_config(cls, config: OscillatorConfig | OctaveOscillatorConfig):
+        kwargs = {"LO_frequency": config.frequency, "gain": config.power}
         if isinstance(config, OctaveOscillatorConfig):
             kwargs["output_mode"] = config.output_mode
         return cls(**kwargs)
@@ -109,9 +109,7 @@ class Controller:
     """https://docs.quantum-machines.co/latest/docs/Introduction/config/?h=opx10#controllers"""
     analog_outputs: dict[int, dict] = field(default_factory=dict)
     digital_outputs: dict[int, dict] = field(default_factory=dict)
-    analog_inputs: dict[int, Union[AnalogInput, MwFemInput]] = field(
-        default_factory=dict
-    )
+    analog_inputs: dict[int, AnalogInput | MwFemInput] = field(default_factory=dict)
 
     def _set_default_inputs(self):
         """Add default inputs in controller config section.
@@ -146,7 +144,7 @@ class Opx1000:
 
 @dataclass
 class Octave:
-    connectivity: Union[str, tuple[str, int]]
+    connectivity: str | tuple[str, int]
     RF_outputs: dict[int, OctaveOutput] = field(default_factory=dict)
     RF_inputs: dict[int, OctaveInput] = field(default_factory=dict)
 
@@ -156,7 +154,7 @@ class Octave:
             self.connectivity = (con, int(fem))
 
 
-ControllerId = Union[str, tuple[str, int]]
+ControllerId = str | tuple[str, int]
 
 
 def process_controller_id(id: ControllerId):
@@ -177,7 +175,7 @@ def process_controller_id(id: ControllerId):
     return id, None
 
 
-class Controllers(dict[str, Union[Controller, Opx1000]]):
+class Controllers(dict[str, Controller | Opx1000]):
     """Dictionary of controllers compatible with OPX+ and OPX1000."""
 
     def __contains__(self, key: ControllerId) -> bool:

@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "qibolab"
-version = "0.2.9"
+version = "0.2.17"
 description = "Quantum hardware module and drivers for Qibo"
 authors = ["The Qibo team"]
 license = "Apache License 2.0"
@@ -22,37 +22,38 @@ include = ["src/*.lark"]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-qibo = "^0.2.16"
 numpy = ">=1.26.4,<3"
 scipy = "^1.13.0"
-pydantic = "^2.6.4"
+pydantic = "^2.4.0"
+qibo = { version = "^0.3.0", optional = true }
 qutip = { version = "^5.0.2", optional = true }
+dynamiqs = { version = "^0.3.4", optional = true }
 pyserial = { version = "^3.5", optional = true }
 
 [tool.poetry.group.dev]
 optional = true
 
 [tool.poetry.group.dev.dependencies]
-pudb = "^2024.1.3"
+pudb = "^2025.1"
 ipython = "^8.12.0"
 
 [tool.poetry.group.docs]
 optional = true
 
 [tool.poetry.group.docs.dependencies]
-sphinx = "^6.1.3"
-furo = "^2023.3.27"
+sphinx = "^8.0"
+furo = "^2025.7.19"
 recommonmark = "^0.7.1"
 sphinxcontrib-bibtex = "^2.5.0"
 sphinx-markdown-tables = "^0.0.17"
 nbsphinx = "^0.9.1"
 ipython = "^8.12.0"
 sphinx-copybutton = "^0.5.1"
-sphinx-toolbox = "^3.10.0"
 # extras
 qcodes = "^0.52.0"
 qcodes_contrib_drivers = "^0.23.0"
 qutip = "^5.0.2"
+sphinx-design = "^0.6.1"
 
 [tool.poetry.group.tests]
 optional = true
@@ -70,10 +71,11 @@ requests = "^2.32.0"
 optional = true
 
 [tool.poetry.group.analysis.dependencies]
-ruff = "^0.9.1"
+ruff = "^0.16.0"
 
 [tool.poetry.extras]
-emulator = ["qutip"]
+backend = ["qibo"]
+emulator = ["qutip", "dynamiqs"]
 qrng = ["pyserial"]
 
 [tool.poe.tasks]
@@ -83,7 +85,7 @@ lint-warnings = """
   ruff check --exit-zero \
   --select F,E,W,C90,N,UP,BLE,FBT,B,A,C4,T10,EM,EXE,ISC,ICN,LOG,G,INP,PIE,T20,PT,Q,RSE,\
            RET,SLF,SLOT,SIM,TC,INT,ARG,PTH,ERA,NPY,PERF,RUF
-"""
+""" # these are some extra strict checks, but just for reporting purposes
 types = "true"
 docs = "make -C doc html"
 docs-clean = "make -C doc clean"
@@ -91,18 +93,20 @@ test-docs = "make -C doc doctest"
 
 [tool.pytest.ini_options]
 testpaths = ['tests/']
-markers = ["qpu: mark tests that require qpu"]
 addopts = [
   '--cov=qibolab',
   '--cov-report=xml',
   '--cov-report=html',
-  '-m not qpu',
   "--ignore=tests/qblox", # TODO: move tests to qibolab-qblox
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F403"]
+[tool.ruff]
+target-version = "py310"
+line-length = 88
 
-[tool.pycln]
-all = true
-exclude = "__init__.py"
+[tool.ruff.lint]
+extend-select = ["I","UP", "D103","D200","D206","D300","D301"] # I -> pycln, D->pydocstyle, UP->pyupgrade
+
+[tool.ruff.lint.per-file-ignores]
+"!src/**/*" = ["D103", "D200", "D206", "D300", "D301"] # skip for non src/ files
+"src/qibolab/_core/instruments/qm/program/loops.py" = ["TRY002"] # Create your own exception

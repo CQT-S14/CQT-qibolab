@@ -47,22 +47,19 @@ and an input acquisition channel.
         return Hardware(instruments={"dummy": controller}, qubits=qubits)
 
 
-And the we can define the following parameters (the exact content is not yet relevant,
-and it will be explained in the :ref:`related section <main_doc_parameters>`).
+Then we can define the following parameters (the exact content is not yet relevant, and
+it will be explained in the :ref:`related section <main_doc_parameters>`).
 
-.. collapse:: Parameters dictionary
+.. TODO: Sphinx 8.2 introduces built-in support for collapsible elements - but it
+   requires dropping py3.10; whenever available, we can drop sphinx-design dependency
+
+.. dropdown:: Parameters dictionary
 
     .. testcode:: python
 
         parameters = {
             "settings": {"nshots": 1000, "relaxation_time": 70000},
             "configs": {
-                "dummy/bounds": {
-                    "kind": "bounds",
-                    "waveforms": 0,
-                    "readout": 0,
-                    "instructions": 0,
-                },
                 "0/drive": {"kind": "iq", "frequency": 4833726197},
                 "0/probe": {"kind": "iq", "frequency": 7320000000},
                 "0/acquisition": {

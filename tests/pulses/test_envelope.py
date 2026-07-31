@@ -4,10 +4,8 @@ import pytest
 from qibolab._core.pulses import (
     Custom,
     Drag,
-    ECap,
     Gaussian,
     GaussianSquare,
-    Iir,
     Pulse,
     Rectangular,
     Snz,
@@ -162,13 +160,13 @@ def test_eq():
     shape2 = Rectangular()
     shape3 = Gaussian(rel_sigma=5)
     assert shape1 == shape2
-    assert not shape1 == shape3
+    assert shape1 != shape3
 
     shape1 = Gaussian(rel_sigma=4)
     shape2 = Gaussian(rel_sigma=4)
     shape3 = Gaussian(rel_sigma=5)
     assert shape1 == shape2
-    assert not shape1 == shape3
+    assert shape1 != shape3
 
     shape1 = GaussianSquare(risefall=4, sigma=0.01)
     shape2 = GaussianSquare(risefall=4, sigma=0.01)
@@ -176,9 +174,9 @@ def test_eq():
     shape4 = GaussianSquare(risefall=4, sigma=0.05)
     shape5 = GaussianSquare(risefall=5, sigma=0.05)
     assert shape1 == shape2
-    assert not shape1 == shape3
-    assert not shape1 == shape4
-    assert not shape1 == shape5
+    assert shape1 != shape3
+    assert shape1 != shape4
+    assert shape1 != shape5
 
     shape1 = Drag(rel_sigma=4, beta=0.01)
     shape2 = Drag(rel_sigma=4, beta=0.01)
@@ -186,21 +184,9 @@ def test_eq():
     shape4 = Drag(rel_sigma=4, beta=0.05)
     shape5 = Drag(rel_sigma=5, beta=0.05)
     assert shape1 == shape2
-    assert not shape1 == shape3
-    assert not shape1 == shape4
-    assert not shape1 == shape5
-
-    shape1 = Iir(a=np.array([-0.5, 2]), b=np.array([1]), target=Rectangular())
-    shape2 = Iir(a=np.array([-0.5, 2]), b=np.array([1]), target=Rectangular())
-    shape3 = Iir(a=np.array([-0.5, 4]), b=np.array([1]), target=Rectangular())
-    shape4 = Iir(a=np.array([-0.4, 2]), b=np.array([1]), target=Rectangular())
-    shape5 = Iir(a=np.array([-0.5, 2]), b=np.array([2]), target=Rectangular())
-    shape6 = Iir(a=np.array([-0.5, 2]), b=np.array([2]), target=Gaussian(rel_sigma=5))
-    assert shape1 == shape2
-    assert not shape1 == shape3
-    assert not shape1 == shape4
-    assert not shape1 == shape5
-    assert not shape1 == shape6
+    assert shape1 != shape3
+    assert shape1 != shape4
+    assert shape1 != shape5
 
     shape1 = Snz(t_idling=5)
     shape2 = Snz(t_idling=5)
@@ -208,15 +194,9 @@ def test_eq():
     shape4 = Snz(t_idling=2, b_amplitude=0.1)
     shape5 = Snz(t_idling=2, b_amplitude=0.1)
     assert shape1 == shape2
-    assert not shape1 == shape3
-    assert not shape1 == shape4
-    assert not shape1 == shape5
-
-    shape1 = ECap(alpha=4)
-    shape2 = ECap(alpha=4)
-    shape3 = ECap(alpha=5)
-    assert shape1 == shape2
-    assert not shape1 == shape3
+    assert shape1 != shape3
+    assert shape1 != shape4
+    assert shape1 != shape5
 
 
 def test_hash_custom():

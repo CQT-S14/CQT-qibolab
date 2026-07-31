@@ -7,23 +7,26 @@ users, but in general any user tool should try to depend only on the
 configuration defined by these classes.
 """
 
+from functools import reduce
 from pathlib import Path
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Literal
 
+import numpy as np
 from pydantic import Field
 
-from ..serialize import Model, NdArray
+from ..serialize import Model, NdArray, eq
+from .filters import Filter
 
 __all__ = [
-    "DcConfig",
-    "IqConfig",
     "AcquisitionConfig",
-    "IqMixerConfig",
-    "OscillatorConfig",
+    "ChannelConfig",
     "Config",
     "Configs",
-    "ChannelConfig",
+    "DcConfig",
+    "IqConfig",
+    "IqMixerConfig",
     "LogConfig",
+    "OscillatorConfig",
 ]
 
 
@@ -43,6 +46,20 @@ class DcConfig(Config):
 
     offset: float
     """DC offset/bias of the channel."""
+    filters: list[Filter] = Field(default_factory=list)
+    """List of filters."""
+
+    @property
+    def feedback(self) -> list[float]:
+        feedback_coeff = [i.feedback for i in self.filters if i is not None]
+        return reduce(np.convolve, feedback_coeff, [1])
+
+    @property
+    def feedforward(self) -> list[float]:
+        feedforward_coeff = [i.feedforward for i in self.filters if i is not None]
+        if len(feedforward_coeff) == 0:
+            return []
+        return reduce(np.convolve, feedforward_coeff)
 
 
 class OscillatorConfig(Config):
@@ -101,30 +118,17 @@ class AcquisitionConfig(Config):
     # FIXME: this is temporary solution to deliver the information to drivers
     # until we make acquisition channels first class citizens in the sequences
     # so that each acquisition command carries the info with it.
-    threshold: Optional[float] = None
+    threshold: float | None = None
     """Signal threshold for discriminating ground and excited states."""
-    iq_angle: Optional[float] = None
+    iq_angle: float | None = None
     """Signal angle in the IQ-plane for disciminating ground and excited
     states."""
-    kernel: Annotated[Optional[NdArray], Field(repr=False)] = None
+    kernel: Annotated[NdArray | None, Field(repr=False)] = None
     """Integration weights to be used when post-processing the acquired
     signal."""
 
     def __eq__(self, other) -> bool:
-        """Explicit configuration equality.
-
-        .. note::
-
-            the expliciti definition is required in order to solve the ambiguity about
-            the arrays equality
-        """
-        return (
-            (self.delay == other.delay)
-            and (self.smearing == other.smearing)
-            and (self.threshold == other.threshold)
-            and (self.iq_angle == other.iq_angle)
-            and (self.kernel == other.kernel).all()
-        )
+        return eq(self, other)
 
 
 class LogConfig(Config):
@@ -135,6 +139,11 @@ class LogConfig(Config):
     path: Path
 
 
-ChannelConfig = Union[
-    DcConfig, IqMixerConfig, OscillatorConfig, IqConfig, AcquisitionConfig, LogConfig
-]
+ChannelConfig = (
+    DcConfig
+    | IqMixerConfig
+    | OscillatorConfig
+    | IqConfig
+    | AcquisitionConfig
+    | LogConfig
+)

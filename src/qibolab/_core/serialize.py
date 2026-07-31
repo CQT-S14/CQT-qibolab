@@ -2,7 +2,7 @@
 
 import base64
 import io
-from typing import Annotated, TypeVar, Union
+from typing import Annotated, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -17,7 +17,7 @@ def ndarray_serialize(ar: npt.NDArray) -> str:
     return base64.standard_b64encode(buffer.read()).decode()
 
 
-def ndarray_deserialize(x: Union[str, npt.NDArray]) -> npt.NDArray:
+def ndarray_deserialize(x: str | npt.NDArray) -> npt.NDArray:
     """Deserialize array."""
     if isinstance(x, np.ndarray):
         return x
@@ -56,8 +56,10 @@ def eq(obj1: BaseModel, obj2: BaseModel) -> bool:
             comparisons.append(
                 (value1.shape == value2.shape) and (value1 == value2).all()
             )
-
-        comparisons.append(value1 == value2)
+        elif isinstance(value1, BaseModel):
+            comparisons.append(eq(value1, value2))
+        else:
+            comparisons.append(value1 == value2)
 
     return all(comparisons)
 

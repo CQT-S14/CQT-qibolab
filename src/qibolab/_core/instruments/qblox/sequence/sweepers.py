@@ -1,10 +1,18 @@
 from collections.abc import Callable, Iterable
 from enum import Enum, auto
 from itertools import groupby
-from typing import Optional
 
 from qibolab._core.identifier import ChannelId
-from qibolab._core.instruments.qblox.q1asm.ast_ import SetAwgGain, SetAwgOffs, SetFreq
+from qibolab._core.instruments.qblox.q1asm.ast_ import (
+    Add,
+    Instruction,
+    Register,
+    SetAwgGain,
+    SetAwgOffs,
+    SetFreq,
+    Value,
+)
+from qibolab._core.instruments.qblox.sequence.asm import Registers
 from qibolab._core.pulses.pulse import (
     Pulse,
     PulseId,
@@ -13,12 +21,6 @@ from qibolab._core.pulses.pulse import (
 from qibolab._core.serialize import Model
 from qibolab._core.sweeper import ParallelSweepers, Parameter, Range, Sweeper
 
-from ..q1asm.ast_ import (
-    Instruction,
-    Register,
-    SetPhDelta,
-    Value,
-)
 from .asm import MAX_PARAM, convert
 
 __all__ = []
@@ -37,8 +39,10 @@ class ParamRole(Enum):
     "Channel offset."
     AMPLITUDE = auto(), Parameter.amplitude
     "Pulse amplitude."
-    PHASE = auto(), Parameter.relative_phase
+    RELATIVE_PHASE = auto(), Parameter.relative_phase
     "Pulse relative phase."
+    PHASE = auto(), Parameter.phase
+    "Virtual Z phase."
     DURATION = auto(), Parameter.duration
     "Pulse duration."
     PULSE_I = auto(), Parameter.duration
@@ -74,11 +78,11 @@ class Param(Model):
     """Increment."""
     role: ParamRole
     """The parameter type."""
-    pulse: Optional[PulseId]
+    pulse: PulseId | None
     """The target pulse (if the sweeper targets pulses)."""
-    channel: Optional[ChannelId]
+    channel: ChannelId | None
     """The target channel (if the sweeper targets channels)."""
-    loop: Optional[int] = None
+    loop: int | None = None
     """The loop which is associated to."""
 
     @property
@@ -93,7 +97,44 @@ class Param(Model):
         )
 
 
-IndexedParams = dict[int, tuple[list[Param], list[Param]]]
+class LoopParams(Model):
+    """Parameters involved in a single loop level."""
+
+    channel: list[Param]
+    pulse: list[Param]
+
+    @property
+    def all(self):
+        return self.channel + self.pulse
+
+
+IndexedParams = dict[int, LoopParams]
+"""Sweep parameters, organized by loop.
+
+Keys are going to be loop counters.
+"""
+
+
+def _channels_pulses(
+    pars: Iterable[Param],
+) -> LoopParams:
+    channels = []
+    pulses = []
+    for p in pars:
+        (channels if p.channel is not None else pulses).append(p)
+    return LoopParams(channel=channels, pulse=pulses)
+
+
+def params_reshape(params: list[Param]) -> IndexedParams:
+    """Split parameters related to channels and pulses.
+
+    Moreover, it reorganize them by loop, to group the updates.
+    """
+    return {
+        key: _channels_pulses(pars)
+        for key, pars in groupby(params, key=lambda p: p.loop)
+        if key is not None
+    }
 
 
 def _pulse_duration(sweep: Sweeper) -> list[tuple[Range, "ParamRole"]]:
@@ -128,7 +169,9 @@ def _unravel_sweeps(sweepers: list[ParallelSweepers]) -> Iterable[tuple[int, Par
                 role=role,
             ),
         )
-        for j, parsweep in enumerate(sweepers)
+        # the first sweeper should be the outermost, thus reverse them during the
+        # enumeration
+        for j, parsweep in enumerate(sweepers[::-1])
         for sweep in parsweep
         for irange, role in _registers(sweep)
         for pulse in (sweep.pulses if sweep.pulses is not None else [None])
@@ -149,8 +192,8 @@ def params(sweepers: list[ParallelSweepers], allocated: int) -> list[Param]:
 
 
 class _Update(Model):
-    update: Optional[Callable[[Value], Instruction]]
-    reset: Optional[Callable[[Value], Instruction]]
+    update: Callable[[Value], Instruction] | None
+    reset: Callable[[Value], Instruction] | None
 
 
 _SWEEP_UPDATE: dict[Parameter, _Update] = {
@@ -165,7 +208,15 @@ _SWEEP_UPDATE: dict[Parameter, _Update] = {
             value_1=MAX_PARAM[Parameter.amplitude],
         ),
     ),
-    Parameter.relative_phase: _Update(update=lambda v: SetPhDelta(value=v), reset=None),
+    Parameter.relative_phase: _Update(
+        update=lambda v: Add(
+            a=Registers.phase_delta.value, b=v, destination=Registers.phase_delta.value
+        ),
+        reset=None,
+    ),
+    # The phase is handled in _process_virtualz, where the relative phase is added to
+    # the accumulated phase delta
+    Parameter.phase: _Update(update=None, reset=None),
     Parameter.duration: _Update(update=None, reset=None),
 }
 
@@ -175,33 +226,12 @@ def update_instructions(
 ) -> list[Instruction]:
     wrapper = _SWEEP_UPDATE[role.kind]
     up = wrapper.update if not reset else wrapper.reset
-    return [up(value)] if up is not None else []
+    instr = [up(value)] if up is not None else []
+    return instr
 
 
 def reset_instructions(role: ParamRole, value: Value) -> list[Instruction]:
     return update_instructions(role, value, reset=True)
-
-
-def _channels_pulses(
-    pars: Iterable[Param],
-) -> tuple[list[Param], list[Param]]:
-    channels = []
-    pulses = []
-    for p in pars:
-        (channels if p.channel is not None else pulses).append(p)
-    return channels, pulses
-
-
-def params_reshape(params: list[Param]) -> IndexedParams:
-    """Split parameters related to channels and pulses.
-
-    Moreover, it reorganize them by loop, to group the updates.
-    """
-    return {
-        key: _channels_pulses(pars)
-        for key, pars in groupby(params, key=lambda p: p.loop)
-        if key is not None
-    }
 
 
 ParameterizedPulse = tuple[PulseLike, set[Param]]
